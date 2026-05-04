@@ -199,3 +199,271 @@ def kde_histogram_2d(
     joint_pdf = _kde_joint_pdf_2d(kernel_values1, kernel_values2, epsilon=epsilon)
 
     return joint_pdf
+
+
+def _kde_joint_pdf_3d(
+    kernel_values1: torch.Tensor,
+    kernel_values2: torch.Tensor,
+    kernel_values3: torch.Tensor,
+    epsilon: torch.Tensor | float = 1e-10,
+) -> torch.Tensor:
+    """
+    Compute the joint probability distribution function for three input tensors.
+
+    :param kernel_values1: Kernel values with shape :math:`(B, N, N_{bins1})`.
+    :param kernel_values2: Kernel values with shape :math:`(B, N, N_{bins2})`.
+    :param kernel_values3: Kernel values with shape :math:`(B, N, N_{bins3})`.
+    :param epsilon: A scalar for numerical stability. Default: 1e-10.
+    :return: Kernel density estimate with shape
+        :math:`(B, N_{bins1}, N_{bins2}, N_{bins3})`.
+    """
+
+    if not isinstance(kernel_values1, torch.Tensor):
+        raise TypeError(
+            "Input kernel_values1 type is not a torch.Tensor. "
+            + f"Got {type(kernel_values1)}"
+        )
+
+    if not isinstance(kernel_values2, torch.Tensor):
+        raise TypeError(
+            "Input kernel_values2 type is not a torch.Tensor. "
+            + f"Got {type(kernel_values2)}"
+        )
+
+    if not isinstance(kernel_values3, torch.Tensor):
+        raise TypeError(
+            "Input kernel_values3 type is not a torch.Tensor. "
+            + f"Got {type(kernel_values3)}"
+        )
+
+    if not (
+        kernel_values1.shape[:-1]
+        == kernel_values2.shape[:-1]
+        == kernel_values3.shape[:-1]
+    ):
+        raise ValueError(
+            "All kernel value tensors must have matching batch and sample dimensions. "
+            + f"Got {kernel_values1.shape}, {kernel_values2.shape}, "
+            + f"{kernel_values3.shape}."
+        )
+
+    joint_kernel_values = torch.einsum(
+        "...ni,...nj,...nk->...ijk",
+        kernel_values1,
+        kernel_values2,
+        kernel_values3,
+    )
+
+    normalization = joint_kernel_values.sum(
+        dim=(-3, -2, -1), keepdim=True
+    ) + epsilon
+    pdf = joint_kernel_values / normalization
+
+    return pdf
+
+
+def kde_histogram_3d(
+    x1: torch.Tensor,
+    x2: torch.Tensor,
+    x3: torch.Tensor,
+    bins1: torch.Tensor,
+    bins2: torch.Tensor,
+    bins3: torch.Tensor,
+    bandwidth: torch.Tensor,
+    weights: torch.Tensor | None = None,
+    epsilon: float | torch.Tensor = 1e-10,
+) -> torch.Tensor:
+    """
+    Estimate the 3D histogram of the input tensor using KDE.
+
+    The computation uses kernel density estimation, which requires a bandwidth
+    smoothing parameter.
+
+    :param x1: Input tensor for the first coordinate with shape :math:`(B, N)`.
+    :param x2: Input tensor for the second coordinate with shape :math:`(B, N)`.
+    :param x3: Input tensor for the third coordinate with shape :math:`(B, N)`.
+    :param bins1: Bin coordinates for the first coordinate.
+    :param bins2: Bin coordinates for the second coordinate.
+    :param bins3: Bin coordinates for the third coordinate.
+    :param bandwidth: Gaussian smoothing factor with shape `()`.
+    :param weights: Optional weights with shape :math:`(B, N)`.
+    :param epsilon: A scalar for numerical stability. Default: 1e-10.
+    :return: Computed 3D histogram with shape
+        :math:`(B, N_{bins1}, N_{bins2}, N_{bins3})`.
+
+    Examples:
+        >>> x1 = torch.rand(2, 32)
+        >>> x2 = torch.rand(2, 32)
+        >>> x3 = torch.rand(2, 32)
+        >>> bins = torch.linspace(0, 1, 64)
+        >>> hist = kde_histogram_3d(
+        ...     x1, x2, x3, bins, bins, bins, bandwidth=torch.tensor(0.01)
+        ... )
+        >>> hist.shape
+        torch.Size([2, 64, 64, 64])
+    """
+
+    _, kernel_values1 = _kde_marginal_pdf(
+        values=x1,
+        bins=bins1,
+        sigma=bandwidth,
+        weights=weights,
+        epsilon=epsilon,
+    )
+    _, kernel_values2 = _kde_marginal_pdf(
+        values=x2,
+        bins=bins2,
+        sigma=bandwidth,
+        weights=None,
+        epsilon=epsilon,
+    )
+    _, kernel_values3 = _kde_marginal_pdf(
+        values=x3,
+        bins=bins3,
+        sigma=bandwidth,
+        weights=None,
+        epsilon=epsilon,
+    )
+
+    joint_pdf = _kde_joint_pdf_3d(
+        kernel_values1,
+        kernel_values2,
+        kernel_values3,
+        epsilon=epsilon,
+    )
+
+    return joint_pdf
+
+
+def _kde_joint_pdf_3d(
+    kernel_values1: torch.Tensor,
+    kernel_values2: torch.Tensor,
+    kernel_values3: torch.Tensor,
+    epsilon: torch.Tensor | float = 1e-10,
+) -> torch.Tensor:
+    """
+    Compute the joint probability distribution function for three input tensors.
+
+    :param kernel_values1: Kernel values with shape :math:`(B, N, N_{bins1})`.
+    :param kernel_values2: Kernel values with shape :math:`(B, N, N_{bins2})`.
+    :param kernel_values3: Kernel values with shape :math:`(B, N, N_{bins3})`.
+    :param epsilon: A scalar for numerical stability. Default: 1e-10.
+    :return: Kernel density estimate with shape
+        :math:`(B, N_{bins1}, N_{bins2}, N_{bins3})`.
+    """
+
+    if not isinstance(kernel_values1, torch.Tensor):
+        raise TypeError(
+            "Input kernel_values1 type is not a torch.Tensor. "
+            + f"Got {type(kernel_values1)}"
+        )
+
+    if not isinstance(kernel_values2, torch.Tensor):
+        raise TypeError(
+            "Input kernel_values2 type is not a torch.Tensor. "
+            + f"Got {type(kernel_values2)}"
+        )
+
+    if not isinstance(kernel_values3, torch.Tensor):
+        raise TypeError(
+            "Input kernel_values3 type is not a torch.Tensor. "
+            + f"Got {type(kernel_values3)}"
+        )
+
+    if not (
+        kernel_values1.shape[:-1]
+        == kernel_values2.shape[:-1]
+        == kernel_values3.shape[:-1]
+    ):
+        raise ValueError(
+            "All kernel value tensors must have matching batch and sample dimensions. "
+            + f"Got {kernel_values1.shape}, {kernel_values2.shape}, "
+            + f"{kernel_values3.shape}."
+        )
+
+    joint_kernel_values = torch.einsum(
+        "...ni,...nj,...nk->...ijk",
+        kernel_values1,
+        kernel_values2,
+        kernel_values3,
+    )
+
+    normalization = joint_kernel_values.sum(
+        dim=(-3, -2, -1), keepdim=True
+    ) + epsilon
+    pdf = joint_kernel_values / normalization
+
+    return pdf
+
+
+def kde_histogram_3d(
+    x1: torch.Tensor,
+    x2: torch.Tensor,
+    x3: torch.Tensor,
+    bins1: torch.Tensor,
+    bins2: torch.Tensor,
+    bins3: torch.Tensor,
+    bandwidth: torch.Tensor,
+    weights: torch.Tensor | None = None,
+    epsilon: float | torch.Tensor = 1e-10,
+) -> torch.Tensor:
+    """
+    Estimate the 3D histogram of the input tensor using KDE.
+
+    The computation uses kernel density estimation, which requires a bandwidth
+    smoothing parameter.
+
+    :param x1: Input tensor for the first coordinate with shape :math:`(B, N)`.
+    :param x2: Input tensor for the second coordinate with shape :math:`(B, N)`.
+    :param x3: Input tensor for the third coordinate with shape :math:`(B, N)`.
+    :param bins1: Bin coordinates for the first coordinate.
+    :param bins2: Bin coordinates for the second coordinate.
+    :param bins3: Bin coordinates for the third coordinate.
+    :param bandwidth: Gaussian smoothing factor with shape `()`.
+    :param weights: Optional weights with shape :math:`(B, N)`.
+    :param epsilon: A scalar for numerical stability. Default: 1e-10.
+    :return: Computed 3D histogram with shape
+        :math:`(B, N_{bins1}, N_{bins2}, N_{bins3})`.
+
+    Examples:
+        >>> x1 = torch.rand(2, 32)
+        >>> x2 = torch.rand(2, 32)
+        >>> x3 = torch.rand(2, 32)
+        >>> bins = torch.linspace(0, 1, 64)
+        >>> hist = kde_histogram_3d(
+        ...     x1, x2, x3, bins, bins, bins, bandwidth=torch.tensor(0.01)
+        ... )
+        >>> hist.shape
+        torch.Size([2, 64, 64, 64])
+    """
+
+    _, kernel_values1 = _kde_marginal_pdf(
+        values=x1,
+        bins=bins1,
+        sigma=bandwidth,
+        weights=weights,
+        epsilon=epsilon,
+    )
+    _, kernel_values2 = _kde_marginal_pdf(
+        values=x2,
+        bins=bins2,
+        sigma=bandwidth,
+        weights=None,
+        epsilon=epsilon,
+    )
+    _, kernel_values3 = _kde_marginal_pdf(
+        values=x3,
+        bins=bins3,
+        sigma=bandwidth,
+        weights=None,
+        epsilon=epsilon,
+    )
+
+    joint_pdf = _kde_joint_pdf_3d(
+        kernel_values1,
+        kernel_values2,
+        kernel_values3,
+        epsilon=epsilon,
+    )
+
+    return joint_pdf
