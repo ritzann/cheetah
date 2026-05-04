@@ -367,3 +367,110 @@ class Screen(Element):
             + f"is_active={repr(self.is_active)}, "
             + f"name={repr(self.name)})"
         )
+
+
+class OTRScreen(Screen):
+#     @property
+#     def reading(self) -> torch.Tensor:
+#         density = super().reading
+
+#         # calculate finite difference of the density
+#         dx = torch.diff(density, dim=-1, append=density[..., :, -1:])
+#         dy = torch.diff(density, dim=-2, append=density[..., -1:, :])
+#         return dx**2 + dy**2
+
+    @property
+    def reading(self) -> torch.Tensor:
+        if not torch.all(torch.isnan(self.cached_reading)):
+            return self.cached_reading
+
+        read_beam = self.get_read_beam()
+        if read_beam is None:
+            image = torch.zeros(
+                (int(self.effective_resolution[1]), int(self.effective_resolution[0])),
+                device=self.misalignment.device,
+                dtype=self.misalignment.dtype,
+            )
+        elif isinstance(read_beam, ParameterBeam):
+            if torch.numel(read_beam._mu[..., 0]) > 1:
+                raise NotImplementedError(
+                    "`Screen` does not support vectorization of `ParameterBeam`. "
+                    "Please use `ParticleBeam` instead. If this is a feature you would "
+                    "like to see, please open an issue on GitHub."
+                )
+
+            transverse_mu = torch.stack(
+                [read_beam._mu[..., 0], read_beam._mu[..., 2]], dim=-1
+            )
+            transverse_cov = torch.stack(
+                [
+                    torch.stack(
+                        [read_beam._cov[..., 0, 0], read_beam._cov[..., 0, 2]], dim=-1
+                    ),
+                    torch.stack(
+                        [read_beam._cov[..., 2, 0], read_beam._cov[..., 2, 2]], dim=-1
+                    ),
+                ],
+                dim=-1,
+            )
+            dist = MultivariateNormal(
+                loc=transverse_mu, covariance_matrix=transverse_cov
+            )
+
+            left = self.extent[0]
+            right = self.extent[1]
+            hstep = self.pixel_size[0] * self.binning
+            bottom = self.extent[2]
+            top = self.extent[3]
+            vstep = self.pixel_size[1] * self.binning
+            x, y = torch.meshgrid(
+                torch.arange(left, right, hstep),
+                torch.arange(bottom, top, vstep),
+                indexing="ij",
+            )
+            pos = torch.dstack((x, y))
+            image = dist.log_prob(pos).exp()
+            image = torch.flip(image, dims=[1])
+        elif isinstance(read_beam, ParticleBeam):
+            if self.method == "histogram":
+                # Catch vectorisation, which is currently not supported by "histogram"
+                if (
+                    len(read_beam.particles.shape) > 2
+                    or len(read_beam.particle_charges.shape) > 1
+                    or len(read_beam.energy.shape) > 0
+                ):
+                    raise NotImplementedError(
+                        "The `'histogram'` method of `Screen` does not support "
+                        "vectorization. Use `'kde'` instead. If this is a feature you "
+                        "would like to see, please open an issue on GitHub."
+                    )
+
+                image, _ = torch.histogramdd(
+                    torch.stack((read_beam.x, read_beam.y)).T,
+                    bins=self.pixel_bin_edges,
+                    weight=read_beam.particle_charges
+                    * read_beam.survival_probabilities,
+                )
+                image = torch.flipud(image.T)
+            elif self.method == "kde":
+                weights = read_beam.particle_charges * read_beam.survival_probabilities
+                broadcasted_x, broadcasted_y, broadcasted_weights = (
+                    torch.broadcast_tensors(read_beam.x, read_beam.y, weights)
+                )
+                image = kde_histogram_2d(
+                    x1=broadcasted_x,
+                    x2=broadcasted_y,
+                    bins1=self.pixel_bin_centers[0].to(read_beam.x),
+                    bins2=self.pixel_bin_centers[1].to(read_beam.x),
+                    bandwidth=self.kde_bandwidth,
+                    weights=broadcasted_weights,
+                )
+                # Change the x, y positions
+                image = torch.transpose(image, -2, -1)
+                # Flip up and down, now row 0 corresponds to the top
+                # image = torch.flip(image, dims=[-2])
+        else:
+            raise TypeError(f"Read beam is of invalid type {type(read_beam)}")
+
+        self.cached_reading = image
+        return image

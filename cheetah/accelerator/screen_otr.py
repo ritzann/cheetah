@@ -3,9 +3,9 @@ import torch.nn.functional as F
 from typing import Literal
 from cheetah.particles import ParticleBeam
 from cheetah.utils import kde_histogram_3d, verify_device_and_dtype
-from screen import Screen
-from svf import SVFGenerator
-from otr import OTRGenerator
+from cheetah.accelerator.screen import Screen
+from cheetah.accelerator.svf import SVFGenerator
+from cheetah.accelerator.otr import OTRGenerator
 
 class OTRScreen(Screen):
     """
@@ -21,7 +21,7 @@ class OTRScreen(Screen):
     :param wavelengths: 1D tensor of wavelengths (um)
     :param svf_params: dict of params for SVFGenerator (gamma, theta_max, res, size, z_gauss_size, prefactor_x, prefactor_y)
     :param N_e: number of electrons in bunch
-    :param cotr_mode: 'coherent','incoherent','mixed'
+    :param otr_mode: 'coherent','incoherent','mixed'
     """
     def __init__(
         self,
@@ -36,15 +36,22 @@ class OTRScreen(Screen):
         sanitize_name=False,
         device=None,
         dtype=None,
-        
         # OTR-specific args (from COTR initial example)
         # Note by Ritz: change to other default params?
         z_size: float = 50.0,       # um
         z_res: float = 17.0,        # pix/um
-        wavelengths: torch.Tensor = None,  # um # replace the None; should be required argument
-        svf_params: dict = None, # replace the None; should be required argument
+        wavelengths: torch.Tensor = torch.tensor([0.4, 0.6, 0.8]),  # um
+        svf_params: dict = {  # default SVF parameters
+            'gamma': 300/0.511,
+            'theta_max': 0.28,
+            'res': 1,
+            'size': 40,
+            'z_gauss_size': 0.08,
+            'prefactor_x': 1.0,
+            'prefactor_y': 1.0,
+        },
         N_e: float = 1.0,
-        cotr_mode: Literal['coherent','incoherent','mixed'] = 'mixed',
+        otr_mode: Literal['coherent','incoherent','mixed'] = 'mixed',
     ):
         # initialize base Screen with KDE method
         super().__init__(
@@ -64,19 +71,23 @@ class OTRScreen(Screen):
         # register OTR parameters
         device = self.pixel_size.device
         dtype = self.pixel_size.dtype
-        self.cotr_mode = cotr_mode
+        self.otr_mode = otr_mode
         self.N_e = N_e
         self.wavelengths = wavelengths.to(device=device, dtype=dtype)
         self.z_res = z_res
         # build longitudinal bins matching z_size and z_res
         Nz = int(z_size * z_res) + 1
-        z_bins = torch.linspace(
-            -z_size/2,
-             z_size/2,
-            steps=Nz,
-            device=device,
-            dtype=dtype,
-        ) # Note by Ritz: how do we really define this?
+        # z_bins = torch.linspace(
+        #     -z_size/2,
+        #      z_size/2,
+        #     steps=Nz,
+        #     device=device,
+        #     dtype=dtype,
+        # ) # Note by Ritz: how do we really define this?
+        # z_size was given in microns, so convert to meters here
+        z_bins_um = torch.linspace(-z_size/2, z_size/2, steps=Nz,
+                                   device=device, dtype=dtype)  # in microns
+        z_bins    = z_bins_um * 1e-6                            # now in meters
         self.register_buffer('z_bins', z_bins)
 
         # instantiate SVFGenerator
@@ -110,7 +121,7 @@ class OTRScreen(Screen):
     @property
     def reading(self) -> torch.Tensor:
         # return cached if exists
-        if not torch.isnan(self.cached_reading).all():
+        if self.cached_reading is not None and not torch.isnan(self.cached_reading).all():
             return self.cached_reading
 
         rb = self.get_read_beam()
@@ -126,20 +137,39 @@ class OTRScreen(Screen):
         # batch dim
         x_, y_, z_, w_ = [t.unsqueeze(0) for t in (x,y,z,w)]
 
+        # dynamically limit z-bins if too many to avoid out of memory error
+        bins1, bins2, bins3 = self.pixel_bin_centers[0], self.pixel_bin_centers[1], self.z_bins
+        max_total = 1e8  # heuristic cap for bins1*bins2*bins3 * num_particles
+        num_particles = w_.shape[-1]
+        total_bins = bins1.numel() * bins2.numel() * bins3.numel()
+        if total_bins * num_particles > max_total:
+            # Too large: automatically downsample z-bins by a factor of 2 until under cap
+            downsample = 2
+            while bins3.numel() * bins1.numel() * bins2.numel() * num_particles > max_total and bins3.numel() > 2:
+                bins3 = bins3[::downsample]
+            # Log a warning for user
+            print(f"Warning: KDE grid too large, downsampled z_bins to {bins3.numel()} slices.")
+        
         # 3D KDE: (1,H,W,Nz)
         hist3d = kde_histogram_3d(
             x1=x_, x2=y_, x3=z_,
-            bins1=self.pixel_bin_centers[0],
-            bins2=self.pixel_bin_centers[1],
-            bins3=self.z_bins,
+            bins1=bins1,
+            bins2=bins2,
+            bins3=bins3,
             bandwidth=self.kde_bandwidth,
             weights=w_,
         )
-        charge3d = hist3d[0]
+        dist3d = hist3d[0]
+        # note by ritz: plot projections of charge dist (create a plotting funtion here)
+        total_charge = (w_).sum()   # since w_ = |particle_charges|*survival
+        dist3d *= total_charge
+        
+        print("sum(dist3d) =", dist3d.sum().item())
+        print("min/max(dist3d) =", dist3d.min().item(), dist3d.max().item())
 
         # compute OTR images
-        cotr_stack = self.otr.forward(charge3d, mode=self.cotr_mode) 
+        otr_stack = self.otr.forward(dist3d, mode=self.otr_mode) # plot IOTR and COTR outputs within otr generator
 
-        self.cached_reading = cotr_stack # shape (N_lambda, H, W)
-        return cotr_stack # include batching here
+        self.cached_reading = otr_stack # shape (N_lambda, H, W)
+        return dist3d, otr_stack # include batching here
 

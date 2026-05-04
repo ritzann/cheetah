@@ -43,7 +43,7 @@ class SVFGenerator:
     
     def perfect_SPF(self, r: torch.Tensor, k: float) -> torch.Tensor:
         """
-        Generates the theoretical single particle function (SPF) for a
+        Generates the theoretical single particle field (SPF) for a
         point charge with location r, at wavenumber k, relativistic
         coefficent gamma, and imaging system defined by theta_max.
 
