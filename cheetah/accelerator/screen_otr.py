@@ -167,9 +167,6 @@ class OTRScreen(Screen):
         # Physical electron-number scaling should be handled by N_e in OTRGenerator.
         total_charge = w_.sum()
 
-        print("sum(dist3d) =", dist3d.sum().item())
-        print("total_charge [C] =", total_charge.item())
-        print("min/max(dist3d) =", dist3d.min().item(), dist3d.max().item())
 
         # compute OTR images
         otr_stack = self.otr.forward(dist3d, mode=self.otr_mode) # plot IOTR and COTR outputs within otr generator

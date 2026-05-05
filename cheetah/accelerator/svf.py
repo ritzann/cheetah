@@ -167,11 +167,9 @@ class SVFGenerator:
         SVF_hor = (self.prefactor_x * self.resize2D_SVF(hor, self.target))
         SVF_ver = (self.prefactor_y * self.resize2D_SVF(ver, self.target))
         SVF_IOTR = SVF_hor ** 2 + SVF_ver ** 2
-        print(SVF_IOTR.shape)
         SVF_hor = SVF_hor * self.z_coeff(wl)
         SVF_ver = SVF_ver * self.z_coeff(wl)
         SVFs = torch.stack([SVF_hor, SVF_ver, SVF_IOTR]).to(torch.complex64)
-        print(SVFs.shape)
 
         return SVFs
         

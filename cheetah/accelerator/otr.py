@@ -67,7 +67,6 @@ class OTRGenerator:
         """
         # dist:   (H, W, N) complex64; wavelengths: (C,) float32
         assert dist.ndim >= 3, f"Expected dist (...,H,W,N), got {dist.shape}"
-        print("dist.dtype:", dist.dtype)
         dist_c = dist.to(self.delta_phase.dtype)  # cast float to complex64
         n = torch.arange(dist_c.shape[-1], device=self.delta_phase.device)
         delta_phase_pows = self.delta_phase[:, None] ** n[None, :]        # (3*M, N)
