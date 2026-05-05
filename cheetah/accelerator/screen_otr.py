@@ -1,8 +1,7 @@
 import torch
-import torch.nn.functional as F
 from typing import Literal
 from cheetah.particles import ParticleBeam
-from cheetah.utils import kde_histogram_3d, verify_device_and_dtype
+from cheetah.utils import kde_histogram_3d
 from cheetah.accelerator.screen import Screen
 from cheetah.accelerator.svf import SVFGenerator
 from cheetah.accelerator.otr import OTRGenerator
@@ -75,6 +74,7 @@ class OTRScreen(Screen):
         self.N_e = N_e
         self.wavelengths = wavelengths.to(device=device, dtype=dtype)
         self.z_res = z_res
+        self.cached_distribution = None
         # build longitudinal bins matching z_size and z_res
         Nz = int(z_size * z_res) + 1
         # z_bins = torch.linspace(
@@ -119,6 +119,13 @@ class OTRScreen(Screen):
         )
 
     @property
+    def distribution(self) -> torch.Tensor:
+        """Return the most recently computed 3D charge distribution."""
+        if self.cached_distribution is None or self.cached_reading is None:
+            _ = self.reading
+        return self.cached_distribution
+
+    @property
     def reading(self) -> torch.Tensor:
         # return cached if exists
         if self.cached_reading is not None and not torch.isnan(self.cached_reading).all():
@@ -137,19 +144,14 @@ class OTRScreen(Screen):
         # batch dim
         x_, y_, z_, w_ = [t.unsqueeze(0) for t in (x,y,z,w)]
 
-        # dynamically limit z-bins if too many to avoid out of memory error
-        bins1, bins2, bins3 = self.pixel_bin_centers[0], self.pixel_bin_centers[1], self.z_bins
-        max_total = 1e8  # heuristic cap for bins1*bins2*bins3 * num_particles
-        num_particles = w_.shape[-1]
-        total_bins = bins1.numel() * bins2.numel() * bins3.numel()
-        if total_bins * num_particles > max_total:
-            # Too large: automatically downsample z-bins by a factor of 2 until under cap
-            downsample = 2
-            while bins3.numel() * bins1.numel() * bins2.numel() * num_particles > max_total and bins3.numel() > 2:
-                bins3 = bins3[::downsample]
-            # Log a warning for user
-            print(f"Warning: KDE grid too large, downsampled z_bins to {bins3.numel()} slices.")
-        
+        # Use requested grid exactly. Do not silently downsample z, because
+        # reducing z to only a few slices destroys the longitudinal projection.
+        bins1, bins2, bins3 = (
+            self.pixel_bin_centers[0],
+            self.pixel_bin_centers[1],
+            self.z_bins,
+        )
+
         # 3D KDE: (1,H,W,Nz)
         hist3d = kde_histogram_3d(
             x1=x_, x2=y_, x3=z_,
@@ -160,16 +162,19 @@ class OTRScreen(Screen):
             weights=w_,
         )
         dist3d = hist3d[0]
-        # note by ritz: plot projections of charge dist (create a plotting funtion here)
-        total_charge = (w_).sum()   # since w_ = |particle_charges|*survival
-        dist3d *= total_charge
-        
+        # Note by Ritz: plot projections of charge dist (create a plotting funtion here)
+        # For now, keep dist3d as a normalized probability-mass distribution.
+        # Physical electron-number scaling should be handled by N_e in OTRGenerator.
+        total_charge = w_.sum()
+
         print("sum(dist3d) =", dist3d.sum().item())
+        print("total_charge [C] =", total_charge.item())
         print("min/max(dist3d) =", dist3d.min().item(), dist3d.max().item())
 
         # compute OTR images
         otr_stack = self.otr.forward(dist3d, mode=self.otr_mode) # plot IOTR and COTR outputs within otr generator
 
+        self.cached_distribution = dist3d
         self.cached_reading = otr_stack # shape (N_lambda, H, W)
-        return dist3d, otr_stack # include batching here
+        return otr_stack
 
