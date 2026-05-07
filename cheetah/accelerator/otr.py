@@ -71,8 +71,10 @@ class OTRGenerator:
         n = torch.arange(dist_c.shape[-1], device=self.delta_phase.device)
         delta_phase_pows = self.delta_phase[:, None] ** n[None, :]        # (3*M, N)
         # sum over longitudinal slices
-        return torch.einsum('cn,...hwn->...chw', delta_phase_pows, dist_c / self.z_res)
-
+        # return torch.einsum('cn,...hwn->...chw', delta_phase_pows, dist_c / self.z_res)
+        # dist is already a normalized probability-mass distribution
+        return torch.einsum('cn,...hwn->...chw', delta_phase_pows, dist_c) # note by Ritz: check with Max
+    
     def _get_COTR2(self, field2d: torch.Tensor) -> torch.Tensor:
         """
         Performs the second step for COTR generation.
@@ -215,7 +217,8 @@ class OTRGenerator:
 #         return out.view(*B, self.num_wls, H, W)
 
         # collapse the longitudinal dimension and get screen dims
-        dens2d = torch.abs(torch.sum(dist, dim=-1)) / self.z_res  # (..., H_screen, W_screen)
+        # dens2d = torch.abs(torch.sum(dist, dim=-1)) / self.z_res  # (..., H_screen, W_screen)
+        dens2d = torch.abs(torch.sum(dist, dim=-1)) # note by Ritz: check with Max
         B_shape, H_screen, W_screen = dens2d.shape[:-2], *dens2d.shape[-2:]
         
         # pick only the intensity (|E|^2) SVF channels
