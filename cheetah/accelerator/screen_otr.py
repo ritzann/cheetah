@@ -87,8 +87,9 @@ class OTRScreen(Screen):
         # z_size was given in microns, so convert to meters here
         z_bins_um = torch.linspace(-z_size/2, z_size/2, steps=Nz,
                                    device=device, dtype=dtype)  # in microns
-        z_bins    = z_bins_um * 1e-6                            # now in meters
-        self.register_buffer('z_bins', z_bins)
+        z_bins_m    = z_bins_um * 1e-6                          # now in meters
+        self.register_buffer("z_bins", z_bins_m)
+        self.register_buffer("z_bins_um", z_bins_um)
 
         # instantiate SVFGenerator
         svf_kwargs = { 
@@ -114,7 +115,7 @@ class OTRScreen(Screen):
         self.otr = OTRGenerator(
             wavelengths=self.wavelengths,
             SVFs=SVFs,
-            z_res=z_res,
+            z_bins_um=self.z_bins_um,
             N_e=N_e,
         )
 
@@ -165,8 +166,7 @@ class OTRScreen(Screen):
         # Note by Ritz: plot projections of charge dist (create a plotting funtion here)
         # For now, keep dist3d as a normalized probability-mass distribution.
         # Physical electron-number scaling should be handled by N_e in OTRGenerator.
-        total_charge = w_.sum()
-
+        # total_charge = w_.sum()
 
         # compute OTR images
         otr_stack = self.otr.forward(dist3d, mode=self.otr_mode) # plot IOTR and COTR outputs within otr generator
