@@ -8,72 +8,189 @@ class OTRGenerator:
     Generates optical transition radiation (OTR) intensity stacks from
     a 3D charge distribution using both coherent and incoherent models.
 
-    Supports batched inputs of shape (..., H, W, N) where N is
+    Supports batched inputs of shape (..., H, W, N_z) where N_z is
     the number of longitudinal slices, and produces outputs of shape
     (..., M, H, W) for M distinct wavelengths.
+
+    Convention
+    ----------
+    The input dist is treated as a probability-mass distribution, not a
+    continuous density sample. For example,
+
+        dist.sum(dim=(-3, -2, -1)) = 1
+
+    for each batch item.
+
+    Therefore, the longitudinal projection does not divide by z_res or dz.
     """
+    
     def __init__(self, 
                  wavelengths: torch.Tensor, 
                  SVFs: torch.Tensor, 
-                 z_res: float, 
-                 N_e: float):
+                 N_e: float | torch.Tensor = 1.0,
+                 z_bins_um: torch.Tensor | None = None,
+                 z_res: float | torch.Tensor | None = None,
+                ):
         """
         Args:
-            wavelengths (torch.Tensor): A 1D tensor of length M containing the
-                wavelengths at which the field will be computed (units: same as
-                z_res).
-            SVFs (torch.Tensor): Complex tensor of shape (3*M, H, W) of single voxel
-            functions (SVFs). Channels are [E_x, E_y, |E|^2] for each wavelength.
-            z_res (float): Longitudinal spatial resolution (delta_z) between charge
-                distribution slices.
-            N_e (float): Total number of electrons in the bunch.
+            wavelengths: Wavelengths in um. A 1D tensor of length M 
+                containing the wavelengths at which the field will be computed 
+                (units: same as z_res).
+                Preferred shape is (M,), where M is the number of wavelengths and
+                SVFs has shape (3 * M, H, W). Channels are grouped as
+                    [E_x(lambda_0), E_y(lambda_0), |E(lambda_0)|^2,
+                     E_x(lambda_1), E_y(lambda_1), |E(lambda_1)|^2,
+                     ...]
+                For backward compatibility, wavelengths may also have shape
+                (3 * M,), with one wavelength value per SVF channel.
+                
+            SVFs: Complex tensor of shape (3 * M, H, W) of single voxel
+                functions (SVFs). Channels are E_x, E_y, and |E|^2 for each wavelength.
+
+            N_e: Total number of electrons in the bunch. Default is 1.0.
+
+            z_bins_um: Optional explicit longitudinal bin centers in um with
+                shape (N_z,). This is the preferred interface.
+            
+            z_res: Optional backward-compatible longitudinal sampling 
+                rate in pix / um. If z_bins_um is not provided, the phase is computed
+                using z_n = n / z_res.
+
         Raises:
-            ValueError: If SVFs first dimension is not compatible with wavelengths.
+            ValueError: If SVFs and wavelengths are incompatible, or if neither
+                z_bins_um nor z_res is provided.
         """
+        if SVFs.ndim != 3:
+            raise ValueError(f"Expected SVFs with shape (3*M,H,W), got {SVFs.shape}.")
+        
         C = SVFs.shape[0]
+        if C % 3 != 0: # 3 correspond to SVF_hor, SVF_ver, SVF_IOTR
+            raise ValueError(f"Expected SVFs first dimension to be divisible by 3, got {C}.")
+
+        self.SVFs = SVFs
+        self.num_wls = C // 3
+        device = SVFs.device
+        real_dtype = SVFs.real.dtype
+
+        wavelengths = wavelengths.to(device=device, dtype=real_dtype)
         M = wavelengths.numel()
-        # determine if user passed unique wavelengths (M*3 == C) or full (M == C)
-        if M * 3 == C: # 3 correspond to SVF_hor, SVF_ver, SVF_IOTR
+        # Determine if user passed unique wavelengths (M == C // 3) or full (M == C)
+        if M == self.num_wls: 
+            # preferred case: one wavelength per physical wavelength.
             wl_full = wavelengths.repeat_interleave(3)
         elif M == C:
+            # backward-compatible case: one wavelength per SVF channel
             wl_full = wavelengths
+            # each triplet should correspond to the same physical wavelength
+            if not (
+                torch.allclose(wl_full[0::3], wl_full[1::3])
+                and torch.allclose(wl_full[0::3], wl_full[2::3])
+            ):
+                raise ValueError("When wavelengths has shape (3*M,), each SVF triplet must "
+                    "contain identical wavelength values."
+                )
         else:
             raise ValueError(f"Wavelengths length ({M}) incompatible with SVFs first dim ({C})")
-        self.wavelengths = wl_full.to(dtype=SVFs.dtype, device=SVFs.device)
-        self.SVFs = SVFs
-        self.z_res = z_res
-        self.N_e = N_e
-        self.num_wls = M
-        # phase factors per SVF channel: shape (3*M, )
-        self.delta_phase = torch.exp(-1j * 2 * math.pi / self.wavelengths / self.z_res)
+        # Full wavelength tensor, one entry per SVF channel
+        # shape: (3 * num_wls,)
+        # used for the coherent phase because COTR1 creates one complex 2D field per SVF channel
+        self.wavelengths = wl_full
+        self.N_e = torch.as_tensor(N_e, device=device, dtype=real_dtype)
+        
+        # check z_bins_um and z_res
+        if z_bins_um is None and z_res is None:
+            raise ValueError("Either z_bins_um or z_res must be provided.")
+        if z_bins_um is not None:
+            self.z_bins_um = z_bins_um.to(device=device, dtype=real_dtype)
+        else:
+            self.z_bins_um = None
+        if z_res is not None:
+            self.z_res = torch.as_tensor(z_res, device=device, dtype=real_dtype)
+            if torch.any(self.z_res <= 0):
+                raise ValueError("z_res must be positive.")
+        else:
+            self.z_res = None
+        
+        
+        # Backward-compatible phase step. Only used when z_bins_um is
+        # not provided.
+        if self.z_bins_um is None:
+            # phase factors per SVF channel: shape (3*M, )
+            self.delta_phase = torch.exp(-1j * 2 * math.pi / self.wavelengths / self.z_res)
+        else:
+            self.delta_phase = None
+
+    
+    def _longitudinal_phase(self, N_z: int) -> torch.Tensor:
+        """
+        Return the longitudinal phase matrix with shape (3*M, N_z).
+
+        Current convention
+        ------------------
+        The longitudinal grid is assumed to be uniform.
+
+        If z_bins_um is provided, only its spacing dz is used. The absolute
+        z-origin is ignored because it contributes only a wavelength-dependent
+        global phase to the coherent field.
+
+        If z_bins_um is not provided, use the backward-compatible convention
+            z_n = n / z_res.
+        """
+        n = torch.arange(N_z, device=self.SVFs.device)
+
+        if self.z_bins_um is not None:
+            if self.z_bins_um.numel() != N_z:
+                raise ValueError(
+                    "z_bins_um length must match the last dimension of dist. "
+                    f"Got z_bins_um length {self.z_bins_um.numel()} and N_z {N_z}."
+                )
+
+            if N_z == 1:
+                return torch.ones(
+                    (self.wavelengths.numel(), 1),
+                    device=self.SVFs.device,
+                    dtype=self.SVFs.dtype,
+                )
+
+            # Uniform-grid convention. We use the bin spacing, not the absolute
+            # coordinate values. This reproduces the old z_res phase convention
+            # while allowing OTRScreen/GPSR code to pass explicit z-bin centers.
+            dz_um = (self.z_bins_um[-1] - self.z_bins_um[0]) / (N_z - 1)
+
+            delta_phase = torch.exp(
+                -1j * 2 * math.pi * dz_um / self.wavelengths
+            )
+
+            return delta_phase[:, None] ** n[None, :]
+
+        return self.delta_phase[:, None] ** n[None, :]
         
     
     def _get_COTR1(self, dist: torch.Tensor) -> torch.Tensor:
         """
-        Generates the effective 2D charge distribution and convolves with the 
+        Generates the effective 2D complex charge distribution and convolves with the 
         single voxel functions (SVFs). The result has S and P polarizations separated.
         First step that transforms the 3D charge distribution into a 2D complex phase
         distribution.
 
         Args:
-            dist (torch.Tensor): A complex tensor of shape (..., H, W, N), representing the 
-                spatial charge distribution over a 2D grid (H, W) and N longitudinal
+            dist (torch.Tensor): A complex tensor of shape (..., H, W, N), representing 
+                the spatial charge distribution over a 2D grid (H, W) and N longitudinal
                 slices.
 
         Returns:
-            torch.Tensor: A complex tensor of shape (..., C, H, W), where C=3*M and each 
-            slice along the first dimension corresponds to the projected complex field for a
-            wavelength.
+            torch.Tensor: A complex tensor of shape (..., 3*M, H, W). Each slice along 
+                the first dimension corresponds to the projected complex field for a
+                wavelength.
         """
-        # dist:   (H, W, N) complex64; wavelengths: (C,) float32
-        assert dist.ndim >= 3, f"Expected dist (...,H,W,N), got {dist.shape}"
-        dist_c = dist.to(self.delta_phase.dtype)  # cast float to complex64
-        n = torch.arange(dist_c.shape[-1], device=self.delta_phase.device)
-        delta_phase_pows = self.delta_phase[:, None] ** n[None, :]        # (3*M, N)
-        # sum over longitudinal slices
-        # return torch.einsum('cn,...hwn->...chw', delta_phase_pows, dist_c / self.z_res)
-        # dist is already a normalized probability-mass distribution
-        return torch.einsum('cn,...hwn->...chw', delta_phase_pows, dist_c) # note by Ritz: check with Max
+        if dist.ndim < 3:
+            raise ValueError(f"Expected dist with shape (..., H, W, N_z), got {dist.shape}.")
+
+        dist_c = dist.to(device=self.SVFs.device, dtype=self.SVFs.dtype)
+        phase = self._longitudinal_phase(dist_c.shape[-1]).to(dtype=self.SVFs.dtype)
+
+        # Since dist is probability mass, do not divide by z_res or dz
+        return torch.einsum("cn,...hwn->...chw", phase, dist_c)
     
     def _get_COTR2(self, field2d: torch.Tensor) -> torch.Tensor:
         """
@@ -87,39 +204,7 @@ class OTRGenerator:
             torch.Tensor: Real tensor of shape (..., 2*M, H, W) containing intensity per
             polarization.
         """
-#         # SVFs, field2d: (..., C, H, W) complex
-#         C, H, W = self.SVFs.shape
-#         assert field2d.shape[-3] == C, \
-#             f"_get_COTR2 expected {C} channels, got {field2d.shape[-3]}"
-        
-#         idx = torch.arange(C, device=self.SVFs.device)
-#         mask = (idx % 3) != 2
-        
-#         SVFs_COTR = self.SVFs[mask]  # (2*M, H, W)
-#         print("SVFs_COTR:",SVFs_COTR.shape)
-#         field     = field2d[..., mask, :, :] # (..., 2*M, H, W)
-        
-#         B = field.shape[:-3] # batch dimension
-#         nC = SVFs_COTR.shape[0] # = 2*M
-        
-#         # build real & imaginary kernels of shape (nC, 1, H, W)
-#         wr = SVFs_COTR.real.unsqueeze(1)
-#         wi = SVFs_COTR.imag.unsqueeze(1)
-        
-#         # flatten batch dims for grouped conv
-#         flat_field = field.reshape(-1, nC, H, W)
-#         fr, fi = flat_field.real, flat_field.imag
-        
-#         # convolution padding to keep the same size
-#         dr, dc = H//2, W//2
-
-#         # **ALL** conv2d calls get the same padding=(dr,dc)
-#         rp = F.conv2d(fr, wr, groups=nC, padding=(dr,dc))
-#         rp = rp - F.conv2d(fi, wi, groups=nC, padding=(dr,dc))
-#         ip = F.conv2d(fr, wi, groups=nC, padding=(dr,dc))
-#         ip = ip + F.conv2d(fi, wr, groups=nC, padding=(dr,dc))
-#         out = (rp + 1j*ip).abs()**2  # shape (B_flat, nC, H, W)
-#         return out.view(*B, nC, H, W) # restore batch dims
+        # SVFs, field2d: (..., C, H, W) complex
         C, H, W = self.SVFs.shape
         assert field2d.shape[-3] == C, \
             f"_get_COTR2 expected {C} channels, got {field2d.shape[-3]}"
@@ -192,30 +277,6 @@ class OTRGenerator:
             torch.Tensor: A real tensor of shape (C, H, W), where each slice along the 
                 first dimension corresponds to the projected complex field for a wavelength.
         """
-#         # dist:   (H, W, N) complex64; wavelengths: (C,) float32
-#         # sum over longitudinal slices and divide by thickness z_res (pix/um) to get 2D density
-#         # dens2d = torch.abs(torch.sum(dist, 2)) / self.z_res # (H, W)
-#         dens2d = torch.abs(torch.sum(dist, dim=-1)) / self.z_res # (H, W)
-#         # print("dens2d size:",dist2d.shape)
-#         B = dens2d.shape[:-2]
-        
-#         C, H, W = self.SVFs.shape
-#         # SVFs, dens2d: (C, H, W) complex
-#         # pick out only the incoherent SVFs
-#         SVF_IOTR = self.SVFs[torch.arange(C, device=self.SVFs.device) % 3 == 2] # (M, H, W)
-#         # print("SVF_IOTR.shape:",SVF_IOTR.shape)
-        
-#         # prepare convolution kernels: (M, 1, H, W)
-#         wr = SVF_IOTR.real.unsqueeze(1)
-#         dens_ch = dens2d.unsqueeze(-3).expand(*B, self.num_wls, H, W)
-#         # flatten batch dims: (B_flat, M, H, W)
-#         flat_dens = dens_ch.reshape(-1, self.num_wls, H, W)
-#         dr, dc = H//2, W//2
-#         # perform grouped convolution: each channel with its kernel
-#         out = F.conv2d(flat_dens, wr, groups=self.num_wls, padding=(dr, dc))
-#         # reshape back: (..., M, H, W)
-#         return out.view(*B, self.num_wls, H, W)
-
         # collapse the longitudinal dimension and get screen dims
         # dens2d = torch.abs(torch.sum(dist, dim=-1)) / self.z_res  # (..., H_screen, W_screen)
         dens2d = torch.abs(torch.sum(dist, dim=-1)) # note by Ritz: check with Max
