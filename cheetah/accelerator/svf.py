@@ -8,9 +8,15 @@ class SVFGenerator:
     Encapsulates Single Voxel Function (SVF) utilities, including theoretical
     kernels, resizing routines, and z-thickness corrections.
     """
-    def __init__(self, gamma: float, theta_max: float, res: int, size: int,
-                 z_gauss_size: float, prefactor_x: float, prefactor_y: float,
-                 device: torch.device = None):
+    def __init__(self, 
+                 gamma: float, 
+                 theta_max: float, 
+                 res: float, 
+                 size: float,
+                 z_gauss_size: float, 
+                 prefactor_x: float = 1.0, 
+                 prefactor_y: float = 1.0,
+                 device: torch.device | None = None):
         """
         Args:
             gamma (float): Lorentz factor for relativistic correction.
@@ -22,24 +28,26 @@ class SVFGenerator:
             prefactor_y (float): Prefactor for vertical component scaling.
             device (torch.device, optional): Computation device (cuda or cpu).
         """
-        self.gamma = gamma
-        self.theta_max = theta_max
-        self.res = res
-        self.size = size
-        self.z_gauss_size = z_gauss_size
-        self.prefactor_x = prefactor_x
-        self.prefactor_y = prefactor_y
+        self.gamma = float(gamma)
+        self.theta_max = float(theta_max)
+        self.res = float(res)
+        self.size = float(size)
+        self.z_gauss_size = float(z_gauss_size)
+        self.prefactor_x = float(prefactor_x)
+        self.prefactor_y = float(prefactor_y)
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         # prepare grid
-        self.grid_res = 10 * self.size * self.res + 1
-        coords = torch.linspace(-self.size/2, self.size/2, steps=self.grid_res, device=self.device)
+        # oersampled grid used to compute the theoretical field before resizing
+        # factor 10 reduces aliasing in the generated SVFs
+        self.oversampling = 10
+        self.grid_res = int(round(self.oversampling * self.size * self.res)) + 1
+        coords = torch.linspace(-self.size/2, self.size/2, steps=self.grid_res, device=self.device, dtype=torch.float64)
         X, Y = torch.meshgrid(coords, coords, indexing='ij')
         R = torch.sqrt(X**2 + Y**2 + 1e-12)
         self.R = R
         self.cos_t, self.sin_t = X/R, Y/R
-        self.target = self.res * self.size + 1 # final target resolution
-    
+        self.target = int(round(self.res * self.size)) + 1  # final target resolution
     
     def perfect_SPF(self, r: torch.Tensor, k: float) -> torch.Tensor:
         """
@@ -74,6 +82,7 @@ class SVFGenerator:
         Returns:
             torch.Tensor: Resized 2D tensor with preserved total sum.
         """
+        pixel_num = int(round(pixel_num))
         if isinstance(array, np.ndarray):
             array = torch.from_numpy(array)
         array = array.to(dtype=torch.float32)
@@ -100,6 +109,7 @@ class SVFGenerator:
         Returns:
             torch.Tensor: Resized 2D tensor with preserved energy (L2 norm squared).
         """
+        pixel_num = int(round(pixel_num))
         if isinstance(array, np.ndarray):
             array = torch.from_numpy(array)
         array = array.to(dtype=torch.float32)
@@ -162,8 +172,6 @@ class SVFGenerator:
         ver = (self.sin_t * spf) / 10
 
         # resize + z-correction
-        target = self.res * self.size + 1
-        
         SVF_hor = (self.prefactor_x * self.resize2D_SVF(hor, self.target))
         SVF_ver = (self.prefactor_y * self.resize2D_SVF(ver, self.target))
         SVF_IOTR = SVF_hor ** 2 + SVF_ver ** 2

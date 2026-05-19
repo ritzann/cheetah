@@ -164,6 +164,27 @@ class OTRGenerator:
             return delta_phase[:, None] ** n[None, :]
 
         return self.delta_phase[:, None] ** n[None, :]
+
+
+    @staticmethod
+    def _conv2d_same(x: torch.Tensor, weight: torch.Tensor, groups: int) -> torch.Tensor:
+        """
+        Grouped 2D convolution with output spatial size equal to input spatial size.
+    
+        This works for both odd and even kernel sizes.
+        """
+        k_h, k_w = weight.shape[-2:]
+    
+        pad_h = k_h - 1
+        pad_w = k_w - 1
+    
+        pad_top = pad_h // 2
+        pad_bottom = pad_h - pad_top
+        pad_left = pad_w // 2
+        pad_right = pad_w - pad_left
+    
+        x = F.pad(x, (pad_left, pad_right, pad_top, pad_bottom))
+        return F.conv2d(x, weight, groups=groups)
         
     
     def _get_COTR1(self, dist: torch.Tensor) -> torch.Tensor:
@@ -230,14 +251,20 @@ class OTRGenerator:
         # flatten all batch dims into one for conv2d
         flat = field_xy.reshape(-1, nC, F_H, F_W)
         fr, fi = flat.real, flat.imag
-        dr, dc = K_H//2, K_W//2
+        # dr, dc = K_H//2, K_W//2
 
-        # perform the 4 real‐valued grouped convolutions
-        rp = F.conv2d(fr, wr, groups=nC, padding=(dr,dc))
-        rp = rp - F.conv2d(fi, wi, groups=nC, padding=(dr,dc))
-        ip = F.conv2d(fr, wi, groups=nC, padding=(dr,dc))
-        ip = ip + F.conv2d(fi, wr, groups=nC, padding=(dr,dc))
+        # # perform the 4 real‐valued grouped convolutions
+        # rp = F.conv2d(fr, wr, groups=nC, padding=(dr,dc))
+        # rp = rp - F.conv2d(fi, wi, groups=nC, padding=(dr,dc))
+        # ip = F.conv2d(fr, wi, groups=nC, padding=(dr,dc))
+        # ip = ip + F.conv2d(fi, wr, groups=nC, padding=(dr,dc))
 
+        rp = self._conv2d_same(fr, wr, groups=nC)
+        rp = rp - self._conv2d_same(fi, wi, groups=nC)
+        
+        ip = self._conv2d_same(fr, wi, groups=nC)
+        ip = ip + self._conv2d_same(fi, wr, groups=nC)
+        
         out = (rp + 1j*ip).abs()**2  # (B_flat, nC, F_H, F_W)
         
         # unflatten back into the original batch dims
@@ -296,8 +323,12 @@ class OTRGenerator:
         
         # flatten all batch dims for grouped conv2d
         flat = dens_ch.reshape(-1, M, H_screen, W_screen)
-        dr, dc = H_kernel // 2, W_kernel // 2
-        out = F.conv2d(flat, wr, groups=M, padding=(dr, dc))  # (B_flat, M, H_screen, W_screen)
+        # dr, dc = H_kernel // 2, W_kernel // 2
+        # out = F.conv2d(flat, wr, groups=M, padding=(dr, dc))  # (B_flat, M, H_screen, W_screen)
+        # # restore original batch dims
+        # return out.view(*B_shape, M, H_screen, W_screen)
+
+        out = self._conv2d_same(flat, wr, groups=M)
         # restore original batch dims
         return out.view(*B_shape, M, H_screen, W_screen)
 
@@ -315,18 +346,42 @@ class OTRGenerator:
           OTRs:   A real tensor of shape (..., M, H, W) 
               representing the summed S and P polarizations.
         """
-        # cotr
-        dist2d = self._get_COTR1(dist) # project 3D charge distribution into 2D fields
-        cotr_per_e = self._get_COTR2(dist2d) # convolve with SVFs and compute intensity
-        cotr_image = self._add_sp(cotr_per_e) # sum polarizations
-        # iotr
-        iotr_image = self._get_IOTR(dist)
+        if mode not in {"coherent", "incoherent", "mixed"}:
+            raise ValueError(
+                "mode must be one of 'coherent', 'incoherent', or 'mixed'. "
+                f"Got {mode!r}."
+            )
         
+        # # cotr
+        # dist2d = self._get_COTR1(dist) # project 3D charge distribution into 2D fields
+        # cotr_per_e = self._get_COTR2(dist2d) # convolve with SVFs and compute intensity
+        # cotr_image = self._add_sp(cotr_per_e) # sum polarizations
+        # # iotr
+        # iotr_image = self._get_IOTR(dist)
+        
+        # if mode == "incoherent":
+        #     images = iotr_image * self.N_e
+        # elif mode == "coherent":
+        #     images = cotr_image * (self.N_e - 1) * self.N_e
+        # elif mode == "mixed":
+        #     images = iotr_image * self.N_e + cotr_image * (self.N_e - 1) * self.N_e
+        # # flip axes to match orientation
+        # return torch.flip(images, dims=[-2, -1])
+
         if mode == "incoherent":
-            images = iotr_image * self.N_e
+            images = self._get_IOTR(dist) * self.N_e
+    
         elif mode == "coherent":
+            dist2d = self._get_COTR1(dist)
+            cotr_per_e = self._get_COTR2(dist2d)
+            cotr_image = self._add_sp(cotr_per_e)
             images = cotr_image * (self.N_e - 1) * self.N_e
-        elif mode == "mixed":
+    
+        else: # mixed: coherent + incoherent
+            dist2d = self._get_COTR1(dist)
+            cotr_per_e = self._get_COTR2(dist2d)
+            cotr_image = self._add_sp(cotr_per_e)
+            iotr_image = self._get_IOTR(dist)
             images = iotr_image * self.N_e + cotr_image * (self.N_e - 1) * self.N_e
-        # flip axes to match orientation
+    
         return torch.flip(images, dims=[-2, -1])
